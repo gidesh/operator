@@ -18,6 +18,11 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+
 	"github.com/VictoriaMetrics/operator/controllers/factory"
 	"github.com/VictoriaMetrics/operator/internal/config"
 	"github.com/go-logr/logr"
@@ -65,12 +70,23 @@ func (r *VMRuleReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 	reqLogger.Info("current count of vm alerts: ", "len", len(alertMngs.Items))
 
-	reqLogger.Info("updating or creating cm for vmalert")
 	for _, vmalert := range alertMngs.Items {
 		reqLogger.WithValues("vmalert", vmalert.Name)
-		reqLogger.Info("reconciling vmalert rules")
+		if vmalert.DeletionTimestamp != nil {
+			continue
+		}
+		reqLogger.WithValues("vmalert", vmalert.Name)
 		currVMAlert := &vmalert
-
+		match, err := isVMAlertMatchesVMRule(currVMAlert, instance)
+		if err != nil {
+			reqLogger.Error(err, "cannot match vmalert and vmRule")
+			continue
+		}
+		// fast path, not match
+		if !match {
+			continue
+		}
+		reqLogger.Info("reconciling vmalert rules")
 		maps, err := factory.CreateOrUpdateRuleConfigMaps(ctx, currVMAlert, r)
 		if err != nil {
 			reqLogger.Error(err, "cannot update rules configmaps")
@@ -96,4 +112,30 @@ func (r *VMRuleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&victoriametricsv1beta1.VMRule{}).
 		Complete(r)
+}
+
+// heuristic for selector match.
+func isVMAlertMatchesVMRule(currentVMalert *victoriametricsv1beta1.VMAlert, vmRule *victoriametricsv1beta1.VMRule) (bool, error) {
+	// fast path
+	if currentVMalert.Spec.RuleNamespaceSelector == nil && currentVMalert.Namespace != vmRule.Namespace {
+		return false, nil
+	}
+	// fast path config unmanaged
+	if currentVMalert.Spec.RuleSelector == nil && currentVMalert.Spec.RuleNamespaceSelector == nil {
+		return false, nil
+	}
+	// fast path maybe namespace selector will match.
+	if currentVMalert.Spec.RuleSelector == nil {
+		return true, nil
+	}
+	selector, err := v1.LabelSelectorAsSelector(currentVMalert.Spec.RuleSelector)
+	if err != nil {
+		return false, fmt.Errorf("cannot parse vmalert's RuleSelector selector as labelSelector: %w", err)
+	}
+	set := labels.Set(vmRule.Labels)
+	// selector not match
+	if !selector.Matches(set) {
+		return false, nil
+	}
+	return true, nil
 }

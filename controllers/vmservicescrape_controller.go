@@ -18,6 +18,11 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+
 	"github.com/VictoriaMetrics/operator/controllers/factory"
 	"github.com/VictoriaMetrics/operator/internal/config"
 	"github.com/go-logr/logr"
@@ -65,8 +70,21 @@ func (r *VMServiceScrapeReconciler) Reconcile(req ctrl.Request) (ctrl.Result, er
 
 	for _, vmagent := range vmAgentInstances.Items {
 		reqLogger = reqLogger.WithValues("vmagent", vmagent.Name)
-		reqLogger.Info("reconciling servicescrapes for vmagent")
+		if vmagent.DeletionTimestamp != nil {
+			continue
+		}
+		reqLogger = reqLogger.WithValues("vmagent", vmagent.Name)
 		currentVMagent := &vmagent
+		match, err := isVMAgentMatchesVMServiceScrape(currentVMagent, instance)
+		if err != nil {
+			reqLogger.Error(err, "cannot match vmagent and vmserviceScrape")
+			continue
+		}
+		// fast path
+		if !match {
+			continue
+		}
+		reqLogger.Info("reconciling servicescrapes for vmagent")
 
 		recon, err := factory.CreateOrUpdateVMAgent(ctx, currentVMagent, r, r.BaseConf)
 		if err != nil {
@@ -85,4 +103,30 @@ func (r *VMServiceScrapeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&victoriametricsv1beta1.VMServiceScrape{}).
 		Complete(r)
+}
+
+// heuristic for selector match.
+func isVMAgentMatchesVMServiceScrape(currentVMAgent *victoriametricsv1beta1.VMAgent, vmServiceScrape *victoriametricsv1beta1.VMServiceScrape) (bool, error) {
+	// fast path
+	if currentVMAgent.Spec.ServiceScrapeNamespaceSelector == nil && currentVMAgent.Namespace != vmServiceScrape.Namespace {
+		return false, nil
+	}
+	// fast path config unmanaged
+	if currentVMAgent.Spec.ServiceScrapeSelector == nil && currentVMAgent.Spec.ServiceScrapeNamespaceSelector == nil {
+		return false, nil
+	}
+	// fast path maybe namespace selector will match.
+	if currentVMAgent.Spec.ServiceScrapeSelector == nil {
+		return true, nil
+	}
+	selector, err := v1.LabelSelectorAsSelector(currentVMAgent.Spec.ServiceScrapeSelector)
+	if err != nil {
+		return false, fmt.Errorf("cannot parse vmagent's ServiceScrapeSelector selector as labelSelector: %w", err)
+	}
+	set := labels.Set(vmServiceScrape.Labels)
+	// selector not match
+	if !selector.Matches(set) {
+		return false, nil
+	}
+	return true, nil
 }
